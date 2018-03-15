@@ -223,6 +223,8 @@ public final class Http2Stream {
     if (!closeInternal(rstStatusCode)) {
       return; // Already closed.
     }
+
+    source.updateClosedStream();
     connection.writeSynReset(id, rstStatusCode);
   }
 
@@ -234,6 +236,8 @@ public final class Http2Stream {
     if (!closeInternal(errorCode)) {
       return; // Already closed.
     }
+
+    source.updateClosedStream();
     connection.writeSynResetLater(id, errorCode);
   }
 
@@ -252,6 +256,18 @@ public final class Http2Stream {
     }
     connection.removeStream(id);
     return true;
+  }
+
+  /** Updates unacknowledgedBytesRead and stream window in case threshold is reached. */
+  void updateUnacknowledgedBytesRead(long read) {
+    synchronized (this) {
+      unacknowledgedBytesRead += read;
+      if (unacknowledgedBytesRead
+          >= connection.okHttpSettings.getInitialWindowSize() / 2) {
+        connection.writeWindowUpdateLater(id, unacknowledgedBytesRead);
+        unacknowledgedBytesRead = 0;
+      }
+    }
   }
 
   void receiveHeaders(List<Header> headers) {
@@ -295,6 +311,8 @@ public final class Http2Stream {
   }
 
   synchronized void receiveRstStream(ErrorCode errorCode) {
+    source.updateClosedStream();
+
     if (this.errorCode == null) {
       this.errorCode = errorCode;
       notifyAll();
@@ -342,25 +360,20 @@ public final class Http2Stream {
         read = readBuffer.read(sink, Math.min(byteCount, readBuffer.size()));
 
         // Flow control: notify the peer that we're ready for more data!
-        unacknowledgedBytesRead += read;
-        if (unacknowledgedBytesRead
-            >= connection.okHttpSettings.getInitialWindowSize() / 2) {
-          connection.writeWindowUpdateLater(id, unacknowledgedBytesRead);
-          unacknowledgedBytesRead = 0;
-        }
+        updateUnacknowledgedBytesRead(read);
       }
 
       // Update connection.unacknowledgedBytesRead outside the stream lock.
-      synchronized (connection) { // Multiple application threads may hit this section.
-        connection.unacknowledgedBytesRead += read;
-        if (connection.unacknowledgedBytesRead
-            >= connection.okHttpSettings.getInitialWindowSize() / 2) {
-          connection.writeWindowUpdateLater(0, connection.unacknowledgedBytesRead);
-          connection.unacknowledgedBytesRead = 0;
-        }
-      }
+      connection.updateUnacknowledgedBytesRead(read);
 
       return read;
+    }
+
+    /** Read remaining data size and update unacknowledgedBytesRead. */
+    void updateClosedStream() {
+      long unread = readBuffer.size();
+      updateUnacknowledgedBytesRead(unread);
+      connection.updateUnacknowledgedBytesRead(unread);
     }
 
     /** Returns once the source is either readable or finished. */
@@ -389,12 +402,18 @@ public final class Http2Stream {
         // If the peer sends more data than we can handle, discard it and close the connection.
         if (flowControlError) {
           in.skip(byteCount);
+
+          // updating unacknowledgedBytesRead for skipped bytes
+          connection.unacknowledgedBytesRead += byteCount;
           closeLater(ErrorCode.FLOW_CONTROL_ERROR);
           return;
         }
 
         // Discard data received after the stream is finished. It's probably a benign race.
         if (finished) {
+
+          // updating unacknowledgedBytesRead for skipped bytes
+          connection.unacknowledgedBytesRead += byteCount;
           in.skip(byteCount);
           return;
         }

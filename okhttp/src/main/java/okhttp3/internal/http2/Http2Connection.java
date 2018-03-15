@@ -536,6 +536,18 @@ public final class Http2Connection implements Closeable {
     return shutdown;
   }
 
+  /** Updates unacknowledgedBytesRead and connection window in case threshold is reached. */
+  void updateUnacknowledgedBytesRead(long read) {
+    synchronized (this) { // Multiple application threads may hit this section.
+      unacknowledgedBytesRead += read;
+      if (unacknowledgedBytesRead
+          >= okHttpSettings.getInitialWindowSize() / 2) {
+        writeWindowUpdateLater(0, unacknowledgedBytesRead);
+        unacknowledgedBytesRead = 0;
+      }
+    }
+  }
+
   public static class Builder {
     Socket socket;
     String hostname;
@@ -631,6 +643,7 @@ public final class Http2Connection implements Closeable {
       if (dataStream == null) {
         writeSynResetLater(streamId, ErrorCode.PROTOCOL_ERROR);
         source.skip(length);
+        updateUnacknowledgedBytesRead(length);
         return;
       }
       dataStream.receiveData(source, length);
