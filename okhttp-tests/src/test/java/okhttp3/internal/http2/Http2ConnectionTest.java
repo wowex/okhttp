@@ -15,15 +15,6 @@
  */
 package okhttp3.internal.http2;
 
-import java.io.IOException;
-import java.io.InterruptedIOException;
-import java.net.Socket;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import okhttp3.internal.Util;
 import okhttp3.internal.http2.MockHttp2Peer.InFrame;
 import okio.AsyncTimeout;
@@ -38,6 +29,16 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TestRule;
 import org.junit.rules.Timeout;
+
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static okhttp3.TestUtil.headerEntries;
 import static okhttp3.TestUtil.repeat;
@@ -1389,6 +1390,108 @@ public final class Http2ConnectionTest {
       assertTrue(windowUpdateStreamIds.contains(0)); // connection
       assertTrue(windowUpdateStreamIds.contains(3)); // stream
     }
+  }
+
+  @Test public void readSendsWindowUpdateOnUnknownFrame() throws Exception {
+    int windowSize = 100;
+    int windowUpdateThreshold = 50;
+
+    // Write the mocking script.
+    peer.sendFrame().settings(new Settings());
+    peer.acceptFrame(); // ACK
+    peer.acceptFrame(); // SYN_STREAM
+    peer.sendFrame().synReply(false, 3, headerEntries("a", "android"));
+    for (int i = 0; i < 3; i++) {
+//       Send frames of summing to size 50, which is windowUpdateThreshold.
+      peer.sendFrame().data(false, 5, data(24), 24);
+      peer.acceptFrame(); // stream RST = error
+      peer.sendFrame().data(false, 5, data(25), 25);
+      peer.acceptFrame(); // stream RST = error
+      peer.sendFrame().data(false, 5, data(1), 1);
+      peer.acceptFrame(); // stream RST = error
+      peer.acceptFrame(); // connection WINDOW UPDATE
+//      peer.acceptFrame(); // stream WINDOW UPDATE, will not appear because this is unknown stream
+    }
+    peer.sendFrame().data(true, 3, data(0), 0);
+    peer.play();
+
+    // Play it back.
+    Http2Connection connection = connect(peer);
+    connection.okHttpSettings.set(INITIAL_WINDOW_SIZE, windowSize);
+    Http2Stream stream = connection.newStream(headerEntries("b", "banana"), false);
+    assertEquals(0, stream.unacknowledgedBytesRead);
+    assertEquals(headerEntries("a", "android"), stream.takeResponseHeaders());
+    Source in = stream.getSource();
+    Buffer buffer = new Buffer();
+    buffer.writeAll(in);
+    assertEquals(-1, in.read(buffer, 1));
+    assertEquals(0, buffer.size());
+
+    InFrame synStream = peer.takeFrame();
+    assertEquals(Http2.TYPE_HEADERS, synStream.type);
+    for (int i = 0; i < 3; i++) {
+      List<Integer> windowUpdateStreamIds = new ArrayList<>(2);
+      for (int j = 0; j < 3; j++) {
+        // for each data packet (24, 25, 1) we'll get protocol error
+        InFrame windowUpdate = peer.takeFrame();
+        assertEquals(Http2.TYPE_RST_STREAM, windowUpdate.type);
+        assertEquals(ErrorCode.PROTOCOL_ERROR, windowUpdate.errorCode);
+      }
+      InFrame windowUpdate = peer.takeFrame();
+      assertEquals(Http2.TYPE_WINDOW_UPDATE, windowUpdate.type);
+
+      windowUpdateStreamIds.add(windowUpdate.streamId);
+      assertEquals(windowUpdateThreshold, windowUpdate.windowSizeIncrement);
+
+      assertTrue(windowUpdateStreamIds.contains(0)); // connection
+      assertTrue(!windowUpdateStreamIds.contains(5)); // stream
+    }
+  }
+
+  @Test public void readSendsWindowUpdateForUnreadDataAfterCancel() throws Exception {
+    int windowSize = 100;
+    int windowUpdateThreshold = 50;
+
+    // Write the mocking script.
+    peer.sendFrame().settings(new Settings());
+    peer.acceptFrame(); // ACK
+    peer.acceptFrame(); // SYN_STREAM
+    peer.sendFrame().synReply(false, 3, headerEntries("a", "android"));
+    peer.sendFrame().data(false, 3, data(windowUpdateThreshold), windowUpdateThreshold);
+    peer.acceptFrame(); // stream WINDOW UPDATE
+    peer.acceptFrame(); // connection WINDOW UPDATE
+    peer.acceptFrame(); // stream RST = cancel
+    peer.play();
+
+    // Play it back.
+    Http2Connection connection = connect(peer);
+    connection.okHttpSettings.set(INITIAL_WINDOW_SIZE, windowSize);
+    Http2Stream stream = connection.newStream(headerEntries("b", "banana"), false);
+    assertEquals(0, stream.unacknowledgedBytesRead);
+    assertEquals(headerEntries("a", "android"), stream.takeResponseHeaders());
+
+    // Simulate client.newCall(request).cancel();
+    stream.closeLater(ErrorCode.CANCEL);
+
+    // headers sent by client
+    InFrame synStream = peer.takeFrame();
+    assertEquals(Http2.TYPE_HEADERS, synStream.type);
+
+    // stream window update sent by client
+    InFrame windowUpdate = peer.takeFrame();
+    assertEquals(3, windowUpdate.streamId);
+    assertEquals(Http2.TYPE_WINDOW_UPDATE, windowUpdate.type);
+
+    // connection window update sent by client
+    windowUpdate = peer.takeFrame();
+    assertEquals(0, windowUpdate.streamId);
+    assertEquals(Http2.TYPE_WINDOW_UPDATE, windowUpdate.type);
+
+    // cancel sent by client
+    InFrame rstStream = peer.takeFrame();
+    assertEquals(Http2.TYPE_RST_STREAM, rstStream.type);
+    assertEquals(ErrorCode.CANCEL, rstStream.errorCode);
+
   }
 
   @Test public void serverSendsEmptyDataClientDoesntSendWindowUpdate() throws Exception {
