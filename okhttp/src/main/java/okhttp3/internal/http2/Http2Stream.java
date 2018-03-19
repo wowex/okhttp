@@ -441,6 +441,7 @@ public final class Http2Stream {
     @Override public void close() throws IOException {
       synchronized (Http2Stream.this) {
         closed = true;
+        source.updateClosedStream();
         readBuffer.clear();
         Http2Stream.this.notifyAll();
       }
